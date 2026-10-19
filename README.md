@@ -59,7 +59,7 @@ The `ServerUrl` can hold other elements than `all` and `bluered`. If you want to
 
 ### Advanced configuration for web clients
 
-Web clients like [gpx.studio](https://gpx.studio/) need to be whitelisted via the `--allow-origins '["https://gpx.studio"]'` option.
+Web clients like [gpx.studio](https://gpx.studio/) need to be whitelisted via the `--allow-origins '["https://gpx.studio","https://studio.wanderstories.space"]'` option.
 Otherwise the browser would reject the responses due to a violation of the [same-origin policy](https://en.wikipedia.org/wiki/Same-origin_policy).
 
 With the option in place, you can add the custom layer `http://localhost:8080/identified/globalheat/all/bluered/{z}/{x}/{y}.png?v=19` for accessing the heatmap.
