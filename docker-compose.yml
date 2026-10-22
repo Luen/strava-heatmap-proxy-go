@@ -1,12 +1,12 @@
 services:
-  strava-heatmap-proxy:
-    image: patrickziegler/strava-heatmap-proxy:latest
-    container_name: strava-heatmap-proxy
-    restart: unless-stopped
-    ports:
-      - "${LOCAL_PORT:-8080}:8080"
-    command:
-      - --allow-origins
-      - '["https://gpx.studio","https://studio.wanderstories.space"]'
-    volumes:
-      - ${HOME}/.config/strava-heatmap-proxy:/home/nonroot/.config/strava-heatmap-proxy:ro
+    strava-heatmap-proxy:
+        image: patrickziegler/strava-heatmap-proxy:latest
+        container_name: strava-heatmap-proxy
+        restart: unless-stopped
+        ports:
+            - '${LOCAL_PORT:-8080}:8080'
+        command:
+            - --allow-origins
+            - '["https://gpx.studio","https://*.wanderstories.space"]'
+        volumes:
+            - ${HOME}/.config/strava-heatmap-proxy:/home/nonroot/.config/strava-heatmap-proxy:ro

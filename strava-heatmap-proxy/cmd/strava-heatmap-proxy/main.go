@@ -13,6 +13,8 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,7 +41,7 @@ func getParam() *Param {
 		CookiesFile:  flag.String("cookies", cookiesfile, "Path to the cookies file"),
 		Port:         flag.String("port", "8080", "Local proxy port"),
 		Target:       flag.String("target", "https://content-a.strava.com/", "Heatmap provider URL"),
-		AllowOrigins: flag.String("allow-origins", "", "JSON array of allowed CORS origins, e.g. '[\"https://a\",\"https://b\"]'"),
+		AllowOrigins: flag.String("allow-origins", "", "JSON array of allowed CORS origins (supports wildcards like https://*.example.com), e.g. '[\"https://a\",\"https://*.b\"]'"),
 		NoInit:       flag.Bool("no-init", false, "Don't try to refresh CloudFront cookies on startup"),
 		Verbose:      flag.Bool("verbose", false, "Verbose logging"),
 		Version:      flag.Bool("version", false, "Print version and exit"),
@@ -54,6 +56,7 @@ type cookieEntry struct {
 }
 
 type StravaSessionClient struct {
+	mu                          sync.RWMutex
 	sessionIdentifier           string
 	cloudFrontCookies           []*http.Cookie
 	cloudFrontCookiesExpiration time.Time
@@ -112,6 +115,8 @@ func (c *StravaSessionClient) readCloudFrontCookiesFromFile(entries []cookieEntr
 		return fmt.Errorf("not all required CloudFront cookies found in file")
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.cloudFrontCookies = cookies
 	if expiration != 0 {
 		c.cloudFrontCookiesExpiration = time.UnixMilli(expiration)
@@ -121,20 +126,111 @@ func (c *StravaSessionClient) readCloudFrontCookiesFromFile(entries []cookieEntr
 	return nil
 }
 
-func parseAllowedOrigins(allowedOrigins string) (map[string]struct{}, error) {
+// cookieState returns a copy of the current CloudFront cookies and their expiration.
+func (c *StravaSessionClient) cookieState() ([]*http.Cookie, time.Time) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cookies := make([]*http.Cookie, len(c.cloudFrontCookies))
+	copy(cookies, c.cloudFrontCookies)
+	return cookies, c.cloudFrontCookiesExpiration
+}
+
+// health reports whether the already-loaded Strava session and CloudFront
+// cookies are present and unexpired at now. It never fetches new cookies.
+func (c *StravaSessionClient) health(now time.Time) (time.Time, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.sessionIdentifier == "" {
+		return time.Time{}, errors.New("no Strava session loaded")
+	}
+	if len(c.cloudFrontCookies) < 4 || c.cloudFrontCookiesExpiration.IsZero() {
+		return time.Time{}, errors.New("CloudFront cookies not loaded")
+	}
+	if !now.Before(c.cloudFrontCookiesExpiration) {
+		return c.cloudFrontCookiesExpiration, errors.New("CloudFront cookies expired")
+	}
+	return c.cloudFrontCookiesExpiration, nil
+}
+
+// wildcardOrigin matches an origin scheme plus a domain and all its
+// subdomains, e.g. scheme "https" and domain "wanderstories.space" matches
+// https://wanderstories.space and https://studio.wanderstories.space, but
+// not https://evilwanderstories.space or http://studio.wanderstories.space.
+type wildcardOrigin struct {
+	scheme string
+	domain string
+}
+
+type originAllowlist struct {
+	// using a map of empty structs for quick membership checks in O(1)
+	exact     map[string]struct{}
+	wildcards []wildcardOrigin
+}
+
+func (a *originAllowlist) allows(origin string) bool {
+	if a == nil || origin == "" {
+		return false
+	}
+	if _, ok := a.exact[origin]; ok {
+		return true
+	}
+	if len(a.wildcards) == 0 {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return false
+	}
+	for _, w := range a.wildcards {
+		if !strings.EqualFold(parsed.Scheme, w.scheme) {
+			continue
+		}
+		if host == w.domain || strings.HasSuffix(host, "."+w.domain) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseAllowedOrigins(allowedOrigins string) (*originAllowlist, error) {
 	var urls []string
 	if err := json.Unmarshal([]byte(allowedOrigins), &urls); err != nil {
 		return nil, fmt.Errorf("invalid JSON for cors-whitelist: %w", err)
 	}
-	// using a map of empty structs for quick membership checks in O(1)
-	m := make(map[string]struct{}, len(urls))
+	allowlist := &originAllowlist{exact: make(map[string]struct{}, len(urls))}
 	for _, u := range urls {
-		if u = string(u); u != "" {
-			// initialize an empty struct
-			m[u] = struct{}{}
+		if u == "" {
+			continue
 		}
+		if !strings.Contains(u, "*") {
+			// initialize an empty struct
+			allowlist.exact[u] = struct{}{}
+			continue
+		}
+		// Wildcard entries look like "https://*.wanderstories.space"
+		// ("https://*wanderstories.space" is accepted as equivalent).
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Scheme == "" {
+			return nil, fmt.Errorf("invalid wildcard origin %q", u)
+		}
+		host := parsed.Hostname()
+		if !strings.HasPrefix(host, "*") || strings.Count(host, "*") != 1 {
+			return nil, fmt.Errorf("invalid wildcard origin %q: '*' must start the host", u)
+		}
+		domain := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(host, "*"), "."))
+		if domain == "" || strings.Contains(domain, "*") {
+			return nil, fmt.Errorf("invalid wildcard origin %q: missing domain after '*'", u)
+		}
+		allowlist.wildcards = append(allowlist.wildcards, wildcardOrigin{
+			scheme: strings.ToLower(parsed.Scheme),
+			domain: domain,
+		})
 	}
-	return m, nil
+	return allowlist, nil
 }
 
 func (c *StravaSessionClient) fetchCloudFrontCookies() error {
@@ -187,13 +283,67 @@ func (c *StravaSessionClient) fetchCloudFrontCookies() error {
 		cookies = append(cookies, &http.Cookie{Name: "_strava4_session", Value: c.sessionIdentifier})
 	}
 
+	c.mu.Lock()
 	c.cloudFrontCookies = cookies
 	if expiration != 0 {
 		c.cloudFrontCookiesExpiration = time.UnixMilli(expiration)
-		log.Printf("New CloudFront cookies will expire at %s", c.cloudFrontCookiesExpiration)
+	}
+	c.mu.Unlock()
+	if expiration != 0 {
+		log.Printf("New CloudFront cookies will expire at %s", time.UnixMilli(expiration))
 	}
 
 	return nil
+}
+
+type healthResponse struct {
+	Status    string `json:"status"`
+	ExpiresAt string `json:"cloudfront_cookies_expire_at,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func serveHealth(w http.ResponseWriter, req *http.Request, client *StravaSessionClient) {
+	expiresAt, err := client.health(time.Now())
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		log.Printf("Health check failed: %v", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if req.Method != http.MethodHead {
+			resp := healthResponse{Status: "error", Error: err.Error()}
+			if !expiresAt.IsZero() {
+				resp.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	if req.Method != http.MethodHead {
+		_ = json.NewEncoder(w).Encode(healthResponse{
+			Status:    "ok",
+			ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+}
+
+func rootHandler(client *StravaSessionClient, proxy http.Handler, allowedOrigins *originAllowlist, verbose bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/" && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
+			serveHealth(w, req, client)
+			return
+		}
+		origin := req.Header.Get("Origin")
+		if origin != "" {
+			if !allowedOrigins.allows(origin) {
+				if verbose {
+					log.Printf("Got request with non-whitelisted origin %s", origin)
+				}
+				http.Error(w, "Forbidden origin", http.StatusForbidden)
+				return
+			}
+		}
+		proxy.ServeHTTP(w, req)
+	}
 }
 
 func main() {
@@ -212,14 +362,14 @@ func main() {
 		log.Fatalf("Could not initialize Strava client: %s", err)
 	}
 
-	if len(client.cloudFrontCookies) == 0 || (!*param.NoInit && time.Now().After(client.cloudFrontCookiesExpiration)) {
+	if cookies, expiration := client.cookieState(); len(cookies) == 0 || (!*param.NoInit && time.Now().After(expiration)) {
 		log.Printf("Fetching new CloudFront cookies...")
 		if err := client.fetchCloudFrontCookies(); err != nil {
 			log.Fatalf("Warning: Failed to fetch CloudFront cookies: %s", err)
 		}
 	}
 
-	var allowedOrigins map[string]struct{}
+	var allowedOrigins *originAllowlist
 	if *param.AllowOrigins != "" {
 		allowedOrigins, err = parseAllowedOrigins(*param.AllowOrigins)
 		if err != nil {
@@ -235,13 +385,14 @@ func main() {
 		}
 		preq.Out.Host = target.Host
 		// refresh expired CloudFront cookies before forwarding the request
-		if client.cloudFrontCookiesExpiration.IsZero() || time.Now().After(client.cloudFrontCookiesExpiration) {
+		if _, expiration := client.cookieState(); expiration.IsZero() || time.Now().After(expiration) {
 			log.Printf("CloudFront cookies have expired, refreshing...")
 			if err := client.fetchCloudFrontCookies(); err != nil {
 				log.Fatalf("Warning: Failed to fetch CloudFront cookies: %s", err)
 			}
 		}
-		for _, c := range client.cloudFrontCookies {
+		cookies, _ := client.cookieState()
+		for _, c := range cookies {
 			preq.Out.AddCookie(c)
 		}
 		if *param.Verbose {
@@ -254,7 +405,7 @@ func main() {
 		ModifyResponse: func(resp *http.Response) error {
 			origin := resp.Request.Header.Get("Origin")
 			if origin != "" {
-				if _, ok := allowedOrigins[origin]; ok {
+				if allowedOrigins.allows(origin) {
 					resp.Header.Set("Access-Control-Allow-Origin", origin)
 				}
 			}
@@ -272,19 +423,7 @@ func main() {
 		},
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		origin := req.Header.Get("Origin")
-		if origin != "" {
-			if _, ok := allowedOrigins[origin]; !ok {
-				if *param.Verbose {
-					log.Printf("Got request with non-whitelisted origin %s", origin)
-				}
-				http.Error(w, "Forbidden origin", http.StatusForbidden)
-				return
-			}
-		}
-		proxy.ServeHTTP(w, req)
-	})
+	http.HandleFunc("/", rootHandler(client, proxy, allowedOrigins, *param.Verbose))
 
 	log.Printf("Started proxy %s for target %s on http://localhost:%s/ ..", version, *param.Target, *param.Port)
 	log.Fatal(http.ListenAndServe(":"+*param.Port, nil))

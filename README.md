@@ -40,6 +40,19 @@ Every request to `http://localhost:8080/` will then be extended with session coo
 
 By default, the necessary cookies are expected to be found in the file `${HOME}/.config/strava-heatmap-proxy/strava-cookies.json` (as created with the [strava-cookie-exporter](#export-cookies) extension).
 
+### Health check
+
+`GET /` (and `HEAD /`) is a health check suitable for uptime monitors, e.g.:
+
+```sh
+curl -i https://strava.wanderstories.space/
+```
+
+- `200 OK` with `{"status":"ok","cloudfront_cookies_expire_at":"2026-10-23T00:00:00Z"}` when the server is running and its Strava CloudFront cookies are loaded and not yet expired.
+- `503 Service Unavailable` with `{"status":"error","error":"..."}` when the cookies are missing or expired. If the process itself is down, you will instead get no response (or a `502` from your reverse proxy), which monitors also treat as down.
+
+The check is passive: it never calls Strava and never triggers a cookie refresh, it only reports the cookies the server already holds (loaded at startup and refreshed on tile requests). Only the exact path `/` is intercepted — all tile paths are proxied as before.
+
 ### Configure your TMS client
 
 To use this with your client of choice, just define a simple [TMS](https://wiki.openstreetmap.org/wiki/TMS) layer like shown below that fetches high resolution heatmap tiles:
@@ -61,6 +74,8 @@ The `ServerUrl` can hold other elements than `all` and `bluered`. If you want to
 
 Web clients like [gpx.studio](https://gpx.studio/) need to be whitelisted via the `--allow-origins '["https://gpx.studio"]'` option.
 Otherwise the browser would reject the responses due to a violation of the [same-origin policy](https://en.wikipedia.org/wiki/Same-origin_policy).
+
+A wildcard entry like `"https://*.wanderstories.space"` whitelists a domain and all its subdomains (including the apex itself), so `'["https://gpx.studio","https://*.wanderstories.space"]'` covers `wanderstories.space`, `studio.wanderstories.space`, `maps.wanderstories.space`, and any future subdomain — but not lookalikes like `evilwanderstories.space`, and not a different scheme (`http://...`).
 
 With the option in place, you can add the custom layer `http://localhost:8080/identified/globalheat/all/bluered/{z}/{x}/{y}.png?v=19` for accessing the heatmap.
 
